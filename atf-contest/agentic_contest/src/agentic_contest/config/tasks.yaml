@@ -1,0 +1,195 @@
+t_interpret_input:
+  description: >
+    Parse the natural language question to determine what is the requirement.
+    Understand the {question} request in natural language to extract the business context from this input. 
+    Extract the KPI of interest and business context from the question.
+  expected_output: >
+    List of required metric from question: name, description, business rules
+  agent: kpi_analyst
+
+t_map_primary_metrics:
+  description: >
+    Translate mentioned KPIs into standardized names and business logic.
+  expected_output: >
+    Dictionary with: KPI name, description, business rules
+  agent: kpi_analyst
+  context:
+    - t_interpret_input
+
+t_define_metrics:
+  description: >
+    Create metric definitions and formulas.
+  expected_output: >
+    YAML or JSON containing:
+      - metric name
+      - business rules
+      - required fields
+      - formula
+      - keywords or entities for table search
+  agent: kpi_analyst
+  context:
+    - t_map_primary_metrics
+
+t_prepare_discovery_queries:
+  description: >
+    Prepare valid query execution inputs to DatabricksSQLTool using correct JSON format.
+  expected_output: >
+    A correctly formatted call using:
+    Action: DatabricksSQLTool
+    Action Input: {"query": "SHOW TABLES IN 30_dtmart"}
+  agent: m_data_analyst
+  context:
+    - t_define_metrics
+  instructions: >
+    Your only goal in this task is to demonstrate the proper tool call format to DatabricksSQLTool.
+
+    Example:
+    ```
+    Action: DatabricksSQLTool
+    Action Input: {
+      "query": "SHOW TABLES IN 30_dtmart"
+    }
+    ```
+    Never wrap this in quotes.
+
+t_list_candidate_tables:
+  description: >
+    Discover tables in schemas `30_dtmart` and `20_edm` using the DatabricksSQLTool. 
+    Use `SHOW TABLES IN <schema>` to list all available tables.
+    Ensure that results are returned by letting the tool handle polling via `statement_id`.
+  expected_output: >
+    List of tables grouped by schema, with a concat of (<schema_name>,'.',<table_name>).  If any schema returns empty, retry once.
+    If both schemas return empty, halt downstream tasks and return error or alert.
+  agent: m_data_analyst
+  context:
+    - t_prepare_discovery_queries
+  instructions: > 
+    You must format tool usage as follows (not stringified JSON):
+
+    ```
+    Action: DatabricksSQLTool
+    Action Input: {
+      "query": "SHOW TABLES IN 30_dtmart"
+    }
+    ```
+
+    Never use escaped quotes or pass JSON as a string. This will break the tool and return empty results.
+    Let the tool handle polling and waiting internally — do not manually poll or retry unless instructed.
+    Retry once for each schema if no tables are returned, and document result.
+    Do not proceed if both schemas return no tables.
+
+
+t_discover_tables:
+  description: >
+    For each metric analyze candidate tables. Check if it's possible to gather all required information
+    from them and then create a dictionary. Build the query base on the schema and table found in previous task t_list_candidate_tables
+    
+  expected_output: >
+    Dictionary of:
+      - Metric name
+      - Matching tables
+      - Required columns found
+      - Sample rows (optional)
+      - Table-level context (e.g., granularity, date fields)
+  agent: m_data_analyst
+  context:
+    - t_list_candidate_tables
+
+t_mapping_result:
+  description: >
+    Document final mapping with table/column usage and logic.
+    Validate if discovered tables fully satisfy metric definitions.
+    If use any qury in validation use the schema and table found in previous task t_discover_tables
+  expected_output: >
+    Detailed documentation of data mapping after a validation.
+  agent: m_data_analyst
+  context:
+    - t_discover_tables
+
+
+t_define_query:
+  description: >
+    Generate SQL query to calculate each KPI.
+    Generate an appropriate SQL query to gather the required data from an existing table of `20_edm` or `30_dtmart` schemas
+    Ensure the syntax is correct
+    Use the DatabricksSQLTool to submit the query for execution.
+    Poll the API until the query execution is complete
+  expected_output: >
+    A SQL query containing required columns and tables of each existing schema. Always ensure the query has a correct syntax, avoid error with \n or any other unnecessary chars
+    
+  agent: data_engineer
+  context:
+    - t_mapping_result
+    - t_list_candidate_tables
+  instructions: >
+    Only use tables from schemas: `30_dtmart` and `20_edm`. If a required field is not found there, flag as a data gap.
+    Tip: Ensure the schema name is correct in query, always following this format: <nm_schema>.<nm_table>
+    If a required table or field is missing, flag as a data gap.
+    Be sure the query doesn't have any char like ` or ` which raises errors during the execution
+
+
+t_execute_query:
+  description: >
+    Execute the SQL using Databricks API.
+    Validate that all referenced tables exist before execution to prevent query failures.
+    The facts and dimensions are only in `20_edm` and `30_dtmart` schema.
+    Tip: Ensure the schema name is correct in query, always following this format: <nm_schema>.<nm_table>
+  expected_output: >
+    Result rows or error logs. If a table is missing, return a structured error indicating which table was not found.
+  agent: data_engineer
+  context:
+    - t_define_query
+  instructions: >
+    Only use tables from schemas: `30_dtmart` and `20_edm`.
+    Before executing the SQL, validate that all referenced tables exist using the output from `t_list_candidate_tables`.
+    If any table is missing, stop execution and return an error with the missing table name(s).
+    Tip: Ensure the schema name is correct in query, always following this format: <nm_schema>.<nm_table>
+
+t_troubleshoot_query:
+  description: >
+    Review and troubleshoot query errors, especially those related to missing tables or schema mismatches.
+  expected_output: >
+    Error diagnosis or fix proposal. If a table is not found, recommend the discovery step be re-run.
+  agent: data_engineer
+  context:
+    - t_execute_query
+  instructions: >
+    Identify whether the error is due to missing tables, fields, or syntax.
+    If a table is not found, flag which one and suggest re-discovery through `t_troubleshoot_metric`.
+
+
+t_troubleshoot_metric:
+  description: >
+    Re-execute discovery for metrics with missing or incompatible table mappings. Suggest alternate tables or redefine rules.
+  expected_output: >
+    Updated mapping information.
+  agent: m_data_analyst
+  context:
+    - t_troubleshoot_query
+
+t_retry_troubleshoot_metric:
+  description: >
+    Retry query generation and execution after metric fix.
+  expected_output: >
+    Final query results or second error.
+  agent: data_engineer
+  context:
+    - t_troubleshoot_metric
+
+t_final_result_de:
+  description: >
+    Gather final metric results from execution.
+  expected_output: >
+    List of KPIs and values.
+  agent: data_engineer
+  context:
+    - t_execute_query
+
+t_final_result_da:
+  description: >
+    Translate technical results into natural language.
+  expected_output: >
+    Business-friendly summary of all KPIs.
+  agent: kpi_analyst
+  context:
+    - t_final_result_de
